@@ -8,7 +8,6 @@
     html, body { margin:0; height:100%; background:#0b0b0f; overflow:hidden; }
     canvas { display:block; width:100%; height:100%; touch-action: manipulation; }
 
-    /* TYPOGRAPHY SYSTEM (intentional hierarchy) */
     :root{
       --text-strong: rgba(255,255,255,.92);
       --text-normal: rgba(255,255,255,.78);
@@ -78,35 +77,35 @@
 (() => {
   "use strict";
 
-  const TOTAL_LEVELS = 20;      // hidden from player
-  const WIN_LOCK_MS = 1300;     // prevent accidental dismissal of win screen
+  const TOTAL_LEVELS = 20;
+  const WIN_LOCK_MS = 1300;
 
-  // Longer relief beat after success
-  const SUCCESS_BEAT_MS = 520;  // was 380
-
-  // Mobile fairness: raised minimum real pause duration
+  const SUCCESS_BEAT_MS = 520;
   const MIN_PAUSE_DUR_S = 0.11;
 
-  // False confidence: rare + learnable (motion never fully stops during fakes)
-  const FALSE_CONF_START_LEVEL = 11; // starts after halfway
-  const FALSE_CONF_MAX_PROB = 0.25;  // "most pauses are real"
+  const FALSE_CONF_START_LEVEL = 11;
+  const FALSE_CONF_MAX_PROB = 0.25;
 
-  // Fake motion learning curve:
-  // At level 11: more detectable motion; by level 20: subtler
-  const FAKE_ROT_FACTOR_EARLY = 0.022; // 2.2% of normal rotation speed
-  const FAKE_ROT_FACTOR_LATE  = 0.010; // 1.0% of normal rotation speed
+  const FAKE_ROT_FACTOR_EARLY = 0.022;
+  const FAKE_ROT_FACTOR_LATE  = 0.010;
 
-  // Fake duration learning curve:
-  // Levels 11–13 are longer to teach; later are shorter
   const FAKE_DUR_EARLY_MIN = 0.075;
   const FAKE_DUR_EARLY_MAX = 0.095;
   const FAKE_DUR_LATE_MIN  = 0.040;
   const FAKE_DUR_LATE_MAX  = 0.055;
 
-  // "Wait." should feel like a thought: clear it quickly
-  const WAIT_HINT_CLEAR_MS = 750; // 600–800ms recommended
+  const WAIT_HINT_CLEAR_MS = 750;
 
-  // Haptics (safe no-op if unsupported)
+  // NEW: two-strike runs
+  const STRIKES_PER_RUN = 2;
+
+  // NEW: subtle real-stillness cue tuning
+  const REAL_STILL_RING_BOOST = 0.08;     // extra ring opacity during real still
+  const REAL_STILL_DOT_BREATH = 0.35;     // dot radius multiplier range (+/-) via sine
+
+  // NEW: teach fake pause once
+  const FAKE_TEACH_LEVEL = 11;
+
   function haptic(pattern) {
     try {
       if (navigator && typeof navigator.vibrate === "function") navigator.vibrate(pattern);
@@ -140,6 +139,9 @@
   let level = 1;
   let bestLevel = 0;
 
+  // NEW: strikes state
+  let strikesLeft = STRIKES_PER_RUN;
+
   let runStartMs = 0;
   let runEndMs = 0;
 
@@ -153,14 +155,11 @@
   let pauseEvery = 1.35;
   let pauseEveryNow = 1.35;
 
-  // Real pause duration
   let pauseDur = 0.16;
 
-  // Pause timing
   let pauseTimer = 0;
 
-  // Pause kinds:
-  // 0 = moving, 1 = fake pause (micro-stop w/ slight motion), 2 = real pause (fully still)
+  // 0 = moving, 1 = fake pause, 2 = real pause
   let pauseMode = 0;
   let fakeDur = 0;
 
@@ -170,11 +169,18 @@
   let shake = 0;
   let message = "";
 
-  // Show "Wait." once
   let waitHintShown = false;
-
-  // NEW: timer to auto-clear center text when showing "Wait."
   let centerAutoClearTimer = 0;
+
+  // NEW: “false still” teach once on fake-fail
+  let falseStillExplained = false;
+
+  // NEW: force a teachable fake pause at level 11 (once per run)
+  let teachFakePending = false;
+  let teachFakeUsed = false;
+
+  // NEW: haptic tick once per real still start
+  let realStillTicked = false;
 
   let lastT = performance.now();
 
@@ -189,7 +195,9 @@
   }
 
   function setHUD() {
-    statusEl.textContent = "Best " + bestLevel;
+    // NEW: show strikes subtly
+    const strikesText = (state === State.IDLE) ? "" : ` • ${strikesLeft}/${STRIKES_PER_RUN}`;
+    statusEl.textContent = "Best " + bestLevel + strikesText;
   }
 
   function clearCenterAutoTimer() {
@@ -205,11 +213,9 @@
   }
 
   function showCenterWaitHint() {
-    // Show "Wait." briefly, then clear it so it feels like a thought
     clearCenterAutoTimer();
     centerEl.textContent = "Wait.";
     centerAutoClearTimer = setTimeout(() => {
-      // Only clear if we're still in MISS state and the text is still "Wait."
       if (state === State.MISS && centerEl.textContent === "Wait.") {
         centerEl.textContent = "";
       }
@@ -226,6 +232,10 @@
   }
 
   function introTextForLevel(n) {
+    // NEW: teach fake pause at level 11 with one extra line
+    if (n === FAKE_TEACH_LEVEL) {
+      return 'Level 11<br><span style="color: rgba(255,255,255,.55); letter-spacing:.06em; font-size: 14px;">Sometimes it only <em>seems</em> still.</span>';
+    }
     if (n === 10) {
       return 'Level 10<br><span style="color: rgba(255,255,255,.55); letter-spacing:.08em; font-size: 14px;">Halfway.</span>';
     }
@@ -261,7 +271,6 @@
 
     omega = clamp(omega, 1.6, 3.2);
     pauseEvery = clamp(pauseEvery, 0.95, 1.6);
-
     pauseDur = clamp(pauseDur, MIN_PAUSE_DUR_S, 0.22);
 
     const jitter = (n <= 5) ? 0 : clamp((n - 5) * 0.02, 0, 0.25);
@@ -283,6 +292,15 @@
     shake = 0;
     message = "";
 
+    realStillTicked = false;
+
+    // NEW: when entering level 11, schedule guaranteed early fake (once per run)
+    if (level === FAKE_TEACH_LEVEL && !teachFakeUsed) {
+      teachFakePending = true;
+    } else if (level !== FAKE_TEACH_LEVEL) {
+      teachFakePending = false;
+    }
+
     setHUD();
   }
 
@@ -290,6 +308,12 @@
     level = 1;
     runStartMs = now;
     runEndMs = 0;
+
+    // NEW: reset strikes & teaching flags per run
+    strikesLeft = STRIKES_PER_RUN;
+    falseStillExplained = false;
+    teachFakePending = false;
+    teachFakeUsed = false;
 
     showEndTime(false);
     setEndTime("");
@@ -304,6 +328,7 @@
   function beginPlay() {
     state = State.PLAY;
     showCenter("");
+    setHUD();
   }
 
   function scheduleNextLevel(now) {
@@ -321,14 +346,40 @@
     showCenter(introTextForLevel(level));
   }
 
+  // NEW: handle strike without immediate run reset
+  function registerStrike(now) {
+    strikesLeft = Math.max(0, strikesLeft - 1);
+    setHUD();
+
+    if (strikesLeft <= 0) {
+      // out of strikes -> go to MISS (tap to restart)
+      state = State.MISS;
+      flash = 1;
+      shake = 1;
+      return true;
+    }
+
+    // still alive: brief feedback but keep playing
+    flash = 1;
+    shake = 0.45;
+    // short lockout via INTRO-like beat to prevent immediate re-tap spam
+    state = State.INTRO;
+    introUntilMs = now + 420;
+    // Keep center text minimal
+    showCenter("");
+    return false;
+  }
+
   function fail(now) {
     haptic(30);
 
-    state = State.MISS;
-    flash = 1;
-    shake = 1;
+    const isFakeFail = (pauseMode === 1);
 
-    if (pauseMode === 1) {
+    // NEW: more instructive fake-fail once
+    if (isFakeFail && !falseStillExplained) {
+      message = "False still.";
+      falseStillExplained = true;
+    } else if (isFakeFail) {
       message = "Not yet.";
     } else {
       const msSincePauseEnd = (lastPauseEndMs >= 0) ? (now - lastPauseEndMs) : Infinity;
@@ -338,11 +389,18 @@
     bestLevel = Math.max(bestLevel, level - 1);
     setHUD();
 
-    // Show "Wait." once on first failure after level 11+ (your current behavior)
+    // Show "Wait." once on first failure after level 11+
     if (!waitHintShown && level >= 11) {
       waitHintShown = true;
-      showCenterWaitHint(); // <<< NEW behavior: clears quickly
+      showCenterWaitHint();
     } else {
+      showCenter("");
+    }
+
+    // NEW: strike system
+    const ended = registerStrike(now);
+    if (ended) {
+      // if run ended, show center message
       showCenter("Miss.");
     }
   }
@@ -410,7 +468,7 @@
     if (e.code === "Space" || e.code === "Enter") tap(performance.now());
   });
 
-  function draw() {
+  function draw(now) {
     const w = canvas.width, h = canvas.height;
 
     ctx.clearRect(0, 0, w, h);
@@ -438,14 +496,26 @@
     const isStillVisual = (pauseMode !== 0);
     const isRealStill = (pauseMode === 2);
 
+    // NEW: subtle secondary cue
+    // - Ring gets slightly brighter on real still
+    const ringAlpha = 0.12 + (isStillVisual ? 0.08 : 0) + (isRealStill ? REAL_STILL_RING_BOOST : 0);
+
     ctx.beginPath();
     ctx.arc(0, 0, ringR, 0, Math.PI * 2);
-    ctx.strokeStyle = "rgba(255,255,255," + (0.12 + (isStillVisual ? 0.08 : 0)) + ")";
+    ctx.strokeStyle = "rgba(255,255,255," + ringAlpha + ")";
     ctx.lineWidth = 2 * DPR;
     ctx.stroke();
 
+    // NEW: center dot "breath" ONLY on real still
+    let dotR = 2.5 * DPR;
+    if (isRealStill) {
+      const t = now * 0.006; // slow breathing
+      const breath = 1 + REAL_STILL_DOT_BREATH * 0.12 * Math.sin(t); // very subtle
+      dotR *= breath;
+    }
+
     ctx.beginPath();
-    ctx.arc(0, 0, 2.5 * DPR, 0, Math.PI * 2);
+    ctx.arc(0, 0, dotR, 0, Math.PI * 2);
     ctx.fillStyle = "rgba(255,255,255,0.5)";
     ctx.fill();
 
@@ -483,7 +553,7 @@
     if (state === State.SUCCESS && now >= successUntilMs) actuallyAdvanceLevel(now);
 
     if (state === State.SUCCESS) {
-      pauseMode = 2; // reward beat: fully still
+      pauseMode = 2;
     }
 
     if (state === State.PLAY) {
@@ -495,12 +565,26 @@
         if (pauseTimer >= pauseEveryNow) {
           pauseTimer = 0;
 
-          const pFake = falseConfidenceProbForLevel(level);
-          if (pFake > 0 && Math.random() < pFake) {
+          // NEW: guaranteed early fake at level 11 (once per run)
+          if (teachFakePending && !teachFakeUsed) {
             pauseMode = 1;
-            fakeDur = fakeDurationForLevel(level);
+            // make it slightly longer to teach
+            fakeDur = Math.max(fakeDurationForLevel(level), 0.095);
+            teachFakePending = false;
+            teachFakeUsed = true;
           } else {
-            pauseMode = 2;
+            const pFake = falseConfidenceProbForLevel(level);
+            if (pFake > 0 && Math.random() < pFake) {
+              pauseMode = 1;
+              fakeDur = fakeDurationForLevel(level);
+            } else {
+              pauseMode = 2;
+              // NEW: haptic tick when real still begins
+              if (!realStillTicked) {
+                haptic(8);
+                realStillTicked = true;
+              }
+            }
           }
         }
       }
@@ -519,10 +603,14 @@
         }
       }
       else if (pauseMode === 2) {
+        // ensure tick is armed once per real-still segment
+        // (we tick at start; when leaving real still, reset for next time)
         if (pauseTimer >= pauseDur) {
           pauseMode = 0;
           pauseTimer = 0;
           lastPauseEndMs = now;
+
+          realStillTicked = false;
 
           const jitter = (level <= 5) ? 0 : clamp((level - 5) * 0.02, 0, 0.25);
           pauseEveryNow = pauseEvery * (1 + (Math.random() * 2 - 1) * jitter);
@@ -535,7 +623,7 @@
     flash = Math.max(0, flash - dt * 2.8);
     shake = Math.max(0, shake - dt * 3.5);
 
-    draw();
+    draw(now);
     requestAnimationFrame(step);
   }
 
