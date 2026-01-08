@@ -1,0 +1,549 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+  <title>WAIT.</title>
+  <style>
+    html, body { margin:0; height:100%; background:#0b0b0f; overflow:hidden; }
+    canvas { display:block; width:100%; height:100%; touch-action: manipulation; }
+
+    /* TYPOGRAPHY SYSTEM (intentional hierarchy) */
+    :root{
+      --text-strong: rgba(255,255,255,.92);
+      --text-normal: rgba(255,255,255,.78);
+      --text-quiet:  rgba(255,255,255,.55);
+      --text-faint:  rgba(255,255,255,.38);
+    }
+
+    .hud{
+      position: fixed; left: 14px; top: 14px;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+      font-size: 13px;
+      line-height: 1.2;
+      color: var(--text-normal);
+      user-select: none;
+      letter-spacing: .04em;
+    }
+    .hud .big{
+      font-size: 16px;
+      font-weight: 600;
+      color: var(--text-strong);
+      letter-spacing: .08em;
+      margin-bottom: 2px;
+    }
+
+    .centerText{
+      position: fixed; inset: 0;
+      display:flex; align-items:center; justify-content:center;
+      text-align:center;
+      pointer-events:none;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+      font-size: 20px;
+      font-weight: 500;
+      color: var(--text-strong);
+      letter-spacing: .02em;
+      padding: 24px;
+    }
+
+    .endTime{
+      position: fixed;
+      left: 0; right: 0;
+      text-align: center;
+      pointer-events: none;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+      font-size: 18px;
+      font-weight: 500;
+      color: var(--text-quiet);
+      letter-spacing: .12em;
+      opacity: 0;
+      transition: opacity 220ms ease;
+    }
+    .endTime.show{ opacity: 1; }
+  </style>
+</head>
+
+<body>
+  <canvas id="c"></canvas>
+
+  <div class="hud">
+    <div class="big">WAIT.</div>
+    <div id="status">Best 0</div>
+  </div>
+
+  <div class="centerText" id="center"></div>
+  <div class="endTime" id="endTime"></div>
+
+<script>
+(() => {
+  "use strict";
+
+  const TOTAL_LEVELS = 20;      // hidden from player
+  const WIN_LOCK_MS = 1300;     // prevent accidental dismissal of win screen
+
+  // Longer relief beat after success
+  const SUCCESS_BEAT_MS = 520;  // was 380
+
+  // Mobile fairness: raised minimum real pause duration
+  const MIN_PAUSE_DUR_S = 0.11;
+
+  // False confidence: rare + learnable (motion never fully stops during fakes)
+  const FALSE_CONF_START_LEVEL = 11; // starts after halfway
+  const FALSE_CONF_MAX_PROB = 0.25;  // "most pauses are real"
+
+  // Fake motion learning curve:
+  // At level 11: more detectable motion; by level 20: subtler
+  const FAKE_ROT_FACTOR_EARLY = 0.022; // 2.2% of normal rotation speed
+  const FAKE_ROT_FACTOR_LATE  = 0.010; // 1.0% of normal rotation speed
+
+  // Fake duration learning curve:
+  // Levels 11–13 are longer to teach; later are shorter
+  const FAKE_DUR_EARLY_MIN = 0.075;
+  const FAKE_DUR_EARLY_MAX = 0.095;
+  const FAKE_DUR_LATE_MIN  = 0.040;
+  const FAKE_DUR_LATE_MAX  = 0.055;
+
+  // "Wait." should feel like a thought: clear it quickly
+  const WAIT_HINT_CLEAR_MS = 750; // 600–800ms recommended
+
+  // Haptics (safe no-op if unsupported)
+  function haptic(pattern) {
+    try {
+      if (navigator && typeof navigator.vibrate === "function") navigator.vibrate(pattern);
+    } catch (_) {}
+  }
+
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d");
+  const statusEl = document.getElementById("status");
+  const centerEl = document.getElementById("center");
+  const endTimeEl = document.getElementById("endTime");
+
+  const DPR = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
+
+  function resize() {
+    const wCss = window.innerWidth;
+    const hCss = window.innerHeight;
+
+    canvas.width = Math.floor(wCss * DPR);
+    canvas.height = Math.floor(hCss * DPR);
+
+    const ringR_css = Math.min(wCss, hCss) * 0.18;
+    endTimeEl.style.top = `${(hCss / 2) + ringR_css + 26}px`;
+  }
+  window.addEventListener("resize", resize, { passive: true });
+  resize();
+
+  const State = { IDLE:0, INTRO:1, PLAY:2, SUCCESS:3, MISS:4, COMPLETE:5 };
+  let state = State.IDLE;
+
+  let level = 1;
+  let bestLevel = 0;
+
+  let runStartMs = 0;
+  let runEndMs = 0;
+
+  let introUntilMs = 0;
+  let successUntilMs = 0;
+  let winUnlockMs = 0;
+
+  let angle = 0;
+  let omega = 1.8;
+
+  let pauseEvery = 1.35;
+  let pauseEveryNow = 1.35;
+
+  // Real pause duration
+  let pauseDur = 0.16;
+
+  // Pause timing
+  let pauseTimer = 0;
+
+  // Pause kinds:
+  // 0 = moving, 1 = fake pause (micro-stop w/ slight motion), 2 = real pause (fully still)
+  let pauseMode = 0;
+  let fakeDur = 0;
+
+  let lastPauseEndMs = -1;
+
+  let flash = 0;
+  let shake = 0;
+  let message = "";
+
+  // Show "Wait." once
+  let waitHintShown = false;
+
+  // NEW: timer to auto-clear center text when showing "Wait."
+  let centerAutoClearTimer = 0;
+
+  let lastT = performance.now();
+
+  function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+  function rand(a, b) { return a + Math.random() * (b - a); }
+
+  function formatTime(ms) {
+    const totalSec = Math.max(0, Math.floor(ms / 1000));
+    const m = Math.floor(totalSec / 60);
+    const s = totalSec % 60;
+    return String(m).padStart(2,"0") + ":" + String(s).padStart(2,"0");
+  }
+
+  function setHUD() {
+    statusEl.textContent = "Best " + bestLevel;
+  }
+
+  function clearCenterAutoTimer() {
+    if (centerAutoClearTimer) {
+      clearTimeout(centerAutoClearTimer);
+      centerAutoClearTimer = 0;
+    }
+  }
+
+  function showCenter(html) {
+    clearCenterAutoTimer();
+    centerEl.innerHTML = html || "";
+  }
+
+  function showCenterWaitHint() {
+    // Show "Wait." briefly, then clear it so it feels like a thought
+    clearCenterAutoTimer();
+    centerEl.textContent = "Wait.";
+    centerAutoClearTimer = setTimeout(() => {
+      // Only clear if we're still in MISS state and the text is still "Wait."
+      if (state === State.MISS && centerEl.textContent === "Wait.") {
+        centerEl.textContent = "";
+      }
+      centerAutoClearTimer = 0;
+    }, WAIT_HINT_CLEAR_MS);
+  }
+
+  function setEndTime(text) {
+    endTimeEl.textContent = text || "";
+  }
+
+  function showEndTime(show) {
+    endTimeEl.classList.toggle("show", !!show);
+  }
+
+  function introTextForLevel(n) {
+    if (n === 10) {
+      return 'Level 10<br><span style="color: rgba(255,255,255,.55); letter-spacing:.08em; font-size: 14px;">Halfway.</span>';
+    }
+    return "Level " + n;
+  }
+
+  function falseConfidenceProbForLevel(n) {
+    if (n < FALSE_CONF_START_LEVEL) return 0;
+    const t = (n - FALSE_CONF_START_LEVEL) / (TOTAL_LEVELS - FALSE_CONF_START_LEVEL);
+    return clamp(FALSE_CONF_MAX_PROB * t, 0, FALSE_CONF_MAX_PROB);
+  }
+
+  function fakeRotationFactorForLevel(n) {
+    if (n < FALSE_CONF_START_LEVEL) return 0;
+    const t = clamp((n - FALSE_CONF_START_LEVEL) / (TOTAL_LEVELS - FALSE_CONF_START_LEVEL), 0, 1);
+    return FAKE_ROT_FACTOR_EARLY + (FAKE_ROT_FACTOR_LATE - FAKE_ROT_FACTOR_EARLY) * t;
+  }
+
+  function fakeDurationForLevel(n) {
+    if (n < FALSE_CONF_START_LEVEL) return 0;
+    const t = clamp((n - FALSE_CONF_START_LEVEL) / (TOTAL_LEVELS - FALSE_CONF_START_LEVEL), 0, 1);
+    const minS = FAKE_DUR_EARLY_MIN + (FAKE_DUR_LATE_MIN - FAKE_DUR_EARLY_MIN) * t;
+    const maxS = FAKE_DUR_EARLY_MAX + (FAKE_DUR_LATE_MAX - FAKE_DUR_EARLY_MAX) * t;
+    return rand(minS, maxS);
+  }
+
+  function computeDifficultyForLevel(n) {
+    const t = (n - 1) / (TOTAL_LEVELS - 1);
+
+    omega = 1.8 + 1.2 * t;
+    pauseEvery = 1.35 - 0.35 * t;
+    pauseDur = 0.16 - 0.075 * t;
+
+    omega = clamp(omega, 1.6, 3.2);
+    pauseEvery = clamp(pauseEvery, 0.95, 1.6);
+
+    pauseDur = clamp(pauseDur, MIN_PAUSE_DUR_S, 0.22);
+
+    const jitter = (n <= 5) ? 0 : clamp((n - 5) * 0.02, 0, 0.25);
+    pauseEveryNow = pauseEvery * (1 + (Math.random() * 2 - 1) * jitter);
+  }
+
+  function resetForLevel(n) {
+    level = clamp(n, 1, TOTAL_LEVELS);
+    computeDifficultyForLevel(level);
+
+    pauseTimer = Math.random() * pauseEveryNow;
+    pauseMode = 0;
+    fakeDur = 0;
+    lastPauseEndMs = -1;
+
+    angle = Math.random() * Math.PI * 2;
+
+    flash = 0;
+    shake = 0;
+    message = "";
+
+    setHUD();
+  }
+
+  function startRun(now) {
+    level = 1;
+    runStartMs = now;
+    runEndMs = 0;
+
+    showEndTime(false);
+    setEndTime("");
+
+    resetForLevel(1);
+
+    state = State.INTRO;
+    introUntilMs = now + 650;
+    showCenter(introTextForLevel(1));
+  }
+
+  function beginPlay() {
+    state = State.PLAY;
+    showCenter("");
+  }
+
+  function scheduleNextLevel(now) {
+    state = State.SUCCESS;
+    successUntilMs = now + SUCCESS_BEAT_MS;
+  }
+
+  function actuallyAdvanceLevel(now) {
+    if (level >= TOTAL_LEVELS) return;
+
+    resetForLevel(level + 1);
+
+    state = State.INTRO;
+    introUntilMs = now + 520;
+    showCenter(introTextForLevel(level));
+  }
+
+  function fail(now) {
+    haptic(30);
+
+    state = State.MISS;
+    flash = 1;
+    shake = 1;
+
+    if (pauseMode === 1) {
+      message = "Not yet.";
+    } else {
+      const msSincePauseEnd = (lastPauseEndMs >= 0) ? (now - lastPauseEndMs) : Infinity;
+      message = (msSincePauseEnd <= 170) ? "Too late." : "Too soon.";
+    }
+
+    bestLevel = Math.max(bestLevel, level - 1);
+    setHUD();
+
+    // Show "Wait." once on first failure after level 11+ (your current behavior)
+    if (!waitHintShown && level >= 11) {
+      waitHintShown = true;
+      showCenterWaitHint(); // <<< NEW behavior: clears quickly
+    } else {
+      showCenter("Miss.");
+    }
+  }
+
+  function complete(now) {
+    haptic([20, 40, 20]);
+
+    state = State.COMPLETE;
+    runEndMs = now;
+
+    bestLevel = TOTAL_LEVELS;
+    setHUD();
+
+    showCenter("You waited.");
+    setEndTime(formatTime(runEndMs - runStartMs));
+    showEndTime(true);
+
+    winUnlockMs = now + WIN_LOCK_MS;
+
+    flash = 1;
+    shake = 0;
+    message = "";
+  }
+
+  function succeed(now) {
+    haptic([10, 20, 10]);
+
+    flash = 1;
+    message = "Still.";
+
+    bestLevel = Math.max(bestLevel, level);
+    setHUD();
+
+    if (level >= TOTAL_LEVELS) {
+      complete(now);
+      return;
+    }
+
+    scheduleNextLevel(now);
+  }
+
+  function tap(now) {
+    if (state === State.IDLE) { startRun(now); return; }
+    if (state === State.MISS) { startRun(now); return; }
+
+    if (state === State.COMPLETE) {
+      if (now < winUnlockMs) return;
+      startRun(now);
+      return;
+    }
+
+    if (state === State.INTRO || state === State.SUCCESS) return;
+    if (state !== State.PLAY) return;
+
+    if (pauseMode === 2) succeed(now);
+    else fail(now);
+  }
+
+  window.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    tap(performance.now());
+  }, { passive: false });
+
+  window.addEventListener("keydown", (e) => {
+    if (e.code === "Space" || e.code === "Enter") tap(performance.now());
+  });
+
+  function draw() {
+    const w = canvas.width, h = canvas.height;
+
+    ctx.clearRect(0, 0, w, h);
+    ctx.fillStyle = "#0b0b0f";
+    ctx.fillRect(0, 0, w, h);
+
+    if (flash > 0.001) {
+      ctx.save();
+      ctx.globalAlpha = 0.12 * flash;
+      ctx.fillStyle = "#fff";
+      ctx.fillRect(0, 0, w, h);
+      ctx.restore();
+    }
+
+    const sx = (Math.random() - 0.5) * 10 * shake;
+    const sy = (Math.random() - 0.5) * 10 * shake;
+    const cx = (w / 2) + sx;
+    const cy = (h / 2) + sy;
+
+    const ringR = Math.min(w, h) * 0.18;
+
+    ctx.save();
+    ctx.translate(cx, cy);
+
+    const isStillVisual = (pauseMode !== 0);
+    const isRealStill = (pauseMode === 2);
+
+    ctx.beginPath();
+    ctx.arc(0, 0, ringR, 0, Math.PI * 2);
+    ctx.strokeStyle = "rgba(255,255,255," + (0.12 + (isStillVisual ? 0.08 : 0)) + ")";
+    ctx.lineWidth = 2 * DPR;
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.arc(0, 0, 2.5 * DPR, 0, Math.PI * 2);
+    ctx.fillStyle = "rgba(255,255,255,0.5)";
+    ctx.fill();
+
+    const len = ringR * 1.05;
+    const x = Math.cos(angle) * len;
+    const y = Math.sin(angle) * len;
+
+    ctx.beginPath();
+    ctx.moveTo(-x, -y);
+    ctx.lineTo(x, y);
+
+    const a = isRealStill ? 0.95 : (isStillVisual ? 0.88 : 0.78);
+    ctx.strokeStyle = "rgba(255,255,255," + a + ")";
+    ctx.lineWidth = 3.2 * DPR;
+    ctx.lineCap = "round";
+    ctx.stroke();
+
+    ctx.restore();
+
+    if (message && state !== State.COMPLETE) {
+      ctx.save();
+      ctx.globalAlpha = 0.75;
+      ctx.fillStyle = "#fff";
+      ctx.font = (14 * DPR) + "px system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial";
+      ctx.fillText(message, 16 * DPR, h - 18 * DPR);
+      ctx.restore();
+    }
+  }
+
+  function step(now) {
+    const dt = Math.min(0.033, (now - lastT) / 1000);
+    lastT = now;
+
+    if (state === State.INTRO && now >= introUntilMs) beginPlay();
+    if (state === State.SUCCESS && now >= successUntilMs) actuallyAdvanceLevel(now);
+
+    if (state === State.SUCCESS) {
+      pauseMode = 2; // reward beat: fully still
+    }
+
+    if (state === State.PLAY) {
+      pauseTimer += dt;
+
+      if (pauseMode === 0) {
+        angle += omega * dt;
+
+        if (pauseTimer >= pauseEveryNow) {
+          pauseTimer = 0;
+
+          const pFake = falseConfidenceProbForLevel(level);
+          if (pFake > 0 && Math.random() < pFake) {
+            pauseMode = 1;
+            fakeDur = fakeDurationForLevel(level);
+          } else {
+            pauseMode = 2;
+          }
+        }
+      }
+      else if (pauseMode === 1) {
+        const fakeFactor = fakeRotationFactorForLevel(level);
+        angle += omega * fakeFactor * dt;
+
+        if (pauseTimer >= fakeDur) {
+          pauseMode = 0;
+          pauseTimer = 0;
+
+          const jitter = (level <= 5) ? 0 : clamp((level - 5) * 0.02, 0, 0.25);
+          pauseEveryNow = pauseEvery * (1 + (Math.random() * 2 - 1) * jitter);
+
+          angle += (Math.random() - 0.5) * 0.08;
+        }
+      }
+      else if (pauseMode === 2) {
+        if (pauseTimer >= pauseDur) {
+          pauseMode = 0;
+          pauseTimer = 0;
+          lastPauseEndMs = now;
+
+          const jitter = (level <= 5) ? 0 : clamp((level - 5) * 0.02, 0, 0.25);
+          pauseEveryNow = pauseEvery * (1 + (Math.random() * 2 - 1) * jitter);
+
+          angle += (Math.random() - 0.5) * 0.15;
+        }
+      }
+    }
+
+    flash = Math.max(0, flash - dt * 2.8);
+    shake = Math.max(0, shake - dt * 3.5);
+
+    draw();
+    requestAnimationFrame(step);
+  }
+
+  setHUD();
+  showEndTime(false);
+  showCenter('<span style="color: rgba(255,255,255,.55)">Tap only when it is still.</span>');
+  requestAnimationFrame(step);
+})();
+</script>
+</body>
+</html>
